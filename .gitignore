@@ -1,0 +1,21 @@
+# Credenciales y entorno
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Datos (entradas/salidas locales, no se versionan)
+*.csv
+*.crdownload
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,130 @@
+# Miner
+
+Miner identifica, a partir de un archivo CSV de repositorios de GitHub, cuáles
+utilizan **GitHub Agentic Workflows (GH-AW)** y genera un nuevo CSV que contiene
+únicamente esos repositorios.
+
+## ¿Qué problema resuelve?
+
+GH-AW es una tecnología reciente de GitHub. Dado un listado amplio de
+repositorios (por ejemplo, el exportado desde [SEART GitHub Search](https://seart-ghs.si.usi.ch/)),
+revisar uno por uno si adoptaron GH-AW es inviable a mano. Miner automatiza esa
+revisión.
+
+### Criterio de identificación
+
+Un repositorio usa GH-AW cuando, dentro de `.github/workflows/`, existe al menos
+un **par de archivos con el mismo nombre base**:
+
+| Archivo | Descripción |
+|---|---|
+| `<base>.md` | definición del workflow agéntico |
+| `<base>.lock.yml` | workflow compilado por GH-AW |
+
+Ejemplo: `daily-report.md` + `daily-report.lock.yml`.
+
+## Requisitos
+
+- Python 3.10 o superior
+- Un token personal de GitHub (para consultar la API sin toparse con el límite
+  de peticiones anónimas)
+
+## Preparar el entorno
+
+```bash
+git clone https://github.com/<tu-usuario>/Miner.git
+cd Miner
+
+python3 -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+```
+
+## Instalar dependencias
+
+```bash
+pip install -e ".[dev]"
+```
+
+Esto instala Miner y sus dependencias: Typer, Pydantic, pandas, PyGithub,
+python-dotenv, Rich y pytest.
+
+## Configurar el token de GitHub
+
+1. Crea un token en <https://github.com/settings/personal-access-tokens>.
+   Para repositorios públicos basta con permisos de **solo lectura**.
+2. Copia el archivo de ejemplo y pega tu token:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+3. Edita `.env`:
+
+   ```
+   GITHUB_TOKEN=tu_token_de_github
+   ```
+
+El archivo `.env` está en `.gitignore`: **nunca se sube al repositorio**.
+
+## Ejecutar Miner
+
+```bash
+miner repositorios.csv --output repositorios_ghaw.csv
+```
+
+Opciones:
+
+| Opción | Descripción | Por defecto |
+|---|---|---|
+| `--output`, `-o` | CSV de salida (solo repos que usan GH-AW) | `repositorios_ghaw.csv` |
+| `--enriched` | CSV adicional con **todas** las filas y la columna binaria `uses_ghaw` | — |
+| `--workers`, `-w` | Consultas concurrentes a la API de GitHub | `8` |
+
+Ejemplo con CSV enriquecido:
+
+```bash
+miner repositorios.csv -o repositorios_ghaw.csv --enriched repositorios_enriquecido.csv
+```
+
+### Entrada
+
+Un CSV con una fila por repositorio. Miner busca automáticamente el identificador
+`owner/repo` en alguna de estas columnas: `name`, `full_name`, `nameWithOwner`,
+`repository`, `repo`, o lo deriva de una columna de URL (`url`, `html_url`, ...).
+El CSV exportado por SEART GitHub Search funciona directamente.
+
+### Salida
+
+Un CSV con las **mismas columnas del archivo de entrada** más una columna
+binaria `uses_ghaw` (siempre `1` en el archivo de salida, ya que solo contiene
+los repositorios que usan GH-AW). El CSV opcional `--enriched` conserva todas
+las filas con `uses_ghaw` en `0`/`1`.
+
+## Pruebas
+
+```bash
+pytest
+```
+
+Las pruebas cubren, como mínimo, la lógica que decide si un conjunto de archivos
+corresponde a un GitHub Agentic Workflow:
+
+- `report.md` + `report.lock.yml` → usa GH-AW
+- `report.md` solo → no usa GH-AW
+- `report.lock.yml` solo → no usa GH-AW
+- `report.md` + `other.lock.yml` → no usa GH-AW
+
+## Estructura del proyecto
+
+```
+src/miner/
+  detector.py       # lógica pura: detección de pares .md / .lock.yml
+  models.py         # modelos Pydantic (validación de datos)
+  csv_io.py         # lectura/escritura de CSV con pandas
+  github_client.py  # acceso a la API de GitHub (PyGithub)
+  pipeline.py       # orquestación del proceso completo
+  cli.py            # interfaz de línea de comandos (Typer)
+tests/
+  test_detector.py
+  test_csv_io.py
+```

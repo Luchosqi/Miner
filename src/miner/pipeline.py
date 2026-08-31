@@ -1,27 +1,31 @@
-"""Orquestación del proceso completo de Miner."""
+"""Orquestación del proceso completo de Miner.
+
+Diseñado para operar con memoria acotada aunque el CSV tenga cientos de miles
+de filas: el CSV se lee por trozos y durante la fase de red no se acumulan
+objetos por repositorio, solo un conjunto de nombres y contadores.
+"""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
-import pandas as pd
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-
-from miner.csv_io import FULL_NAME_COL, read_candidates, write_results
+from miner.csv_io import iter_candidate_names, write_filtered
 from miner.detector import find_ghaw_pairs
 from miner.github_client import GitHubGraphQLClient, _log
 from miner.models import RepoResult
+
+
+@dataclass
+class RunSummary:
+    analyzed: int
+    hits: int
+    errors: int
+    written: int
 
 
 def _chunks(seq: Sequence[str], size: int) -> Iterator[list[str]]:
@@ -41,21 +45,29 @@ def result_from_files(full_name: str, files: list[str] | None) -> RepoResult:
     )
 
 
-def _load_checkpoint(path: Path) -> dict[str, RepoResult]:
+def _load_checkpoint(path: Path) -> tuple[set[str], set[str], int]:
+    """Devuelve ``(procesados, con_ghaw, n_errores)`` a partir del checkpoint JSONL."""
+    processed: set[str] = set()
+    hits: set[str] = set()
+    errors = 0
     if not path.exists():
-        return {}
-    done: dict[str, RepoResult] = {}
+        return processed, hits, errors
     with path.open(encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
             try:
-                done_obj = RepoResult(**json.loads(line))
+                obj = json.loads(line)
+                name = obj["full_name"]
             except Exception:  # noqa: BLE001 - línea corrupta: se reintenta el repo
                 continue
-            done[done_obj.full_name] = done_obj
-    return done
+            processed.add(name)
+            if obj.get("uses_ghaw"):
+                hits.add(name)
+            if obj.get("error"):
+                errors += 1
+    return processed, hits, errors
 
 
 def run(
@@ -68,39 +80,25 @@ def run(
     request_delay: float = 0.3,
     enriched_csv: str | Path | None = None,
     checkpoint_path: str | Path | None = ".miner_checkpoint.jsonl",
-) -> tuple[dict[str, RepoResult], pd.DataFrame]:
+) -> RunSummary:
     """Pipeline completo: leer CSV -> consultar GitHub (GraphQL) -> filtrar -> escribir CSV.
 
     Escribe cada resultado en un checkpoint JSONL; si el proceso se interrumpe,
     volver a ejecutarlo retoma donde quedó.
     """
-    df = read_candidates(input_csv)
-    all_names = list(dict.fromkeys(df[FULL_NAME_COL].tolist()))  # únicos, orden estable
+    all_names = list(dict.fromkeys(iter_candidate_names(input_csv)))  # únicos, orden estable
 
     checkpoint = Path(checkpoint_path) if checkpoint_path else None
-    results: dict[str, RepoResult] = _load_checkpoint(checkpoint) if checkpoint else {}
-    pending = [name for name in all_names if name not in results]
+    processed, hits, errors = _load_checkpoint(checkpoint) if checkpoint else (set(), set(), 0)
+    pending = [name for name in all_names if name not in processed]
 
     ck_lock = Lock()
     ck_file = checkpoint.open("a", encoding="utf-8") if checkpoint else None
 
-    columns = (
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TextColumn("<"),
-        TimeRemainingColumn(),
-    )
+    _log(f"{len(all_names)} repos en el CSV · {len(processed)} ya procesados · {len(pending)} pendientes")
 
     try:
-        with (
-            GitHubGraphQLClient(token, request_delay=request_delay) as client,
-            Progress(*columns) as progress,
-        ):
-            task = progress.add_task(
-                "Analizando repositorios", total=len(all_names), completed=len(results)
-            )
+        with GitHubGraphQLClient(token, request_delay=request_delay) as client:
 
             def handle_batch(batch: list[str]) -> list[RepoResult]:
                 mapping = client.fetch_workflow_files(batch)
@@ -115,23 +113,26 @@ def run(
                 for future in as_completed(futures):
                     batch_results = future.result()
                     for res in batch_results:
-                        results[res.full_name] = res
+                        processed.add(res.full_name)
+                        if res.uses_ghaw:
+                            hits.add(res.full_name)
+                        if res.error:
+                            errors += 1
                     if ck_file is not None:
                         with ck_lock:
                             for res in batch_results:
                                 ck_file.write(res.model_dump_json() + "\n")
                             ck_file.flush()
-                    progress.advance(task, len(batch_results))
                     done_since_log += len(batch_results)
                     if done_since_log >= 5000:
                         done_since_log = 0
-                        hits = sum(1 for r in results.values() if r.uses_ghaw)
-                        _log(
-                            f"{len(results)}/{len(all_names)} repos · {hits} usan GH-AW"
-                        )
+                        _log(f"{len(processed)}/{len(all_names)} repos · {len(hits)} usan GH-AW")
     finally:
         if ck_file is not None:
             ck_file.close()
 
-    filtered = write_results(df, results, output_csv, enriched_path=enriched_csv)
-    return results, filtered
+    _log("Consultas terminadas; escribiendo CSV de salida...")
+    written = write_filtered(input_csv, hits, output_csv, enriched_path=enriched_csv)
+    return RunSummary(
+        analyzed=len(processed), hits=len(hits), errors=errors, written=written
+    )

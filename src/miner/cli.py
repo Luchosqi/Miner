@@ -68,7 +68,7 @@ def main(
         )
         raise typer.Exit(code=1)
 
-    results, filtered = run(
+    summary = run(
         input_csv,
         output,
         token,
@@ -79,17 +79,14 @@ def main(
         checkpoint_path=None if no_checkpoint else checkpoint,
     )
 
-    total = len(results)
-    hits = sum(1 for r in results.values() if r.uses_ghaw)
-    errors = sum(1 for r in results.values() if r.error)
-
     rprint(
         f"\n[green]Proceso terminado.[/green] "
-        f"{total} repos analizados · [bold]{hits}[/bold] usan GH-AW · {errors} no accesibles."
+        f"{summary.analyzed} repos analizados · [bold]{summary.hits}[/bold] usan GH-AW "
+        f"· {summary.errors} no accesibles."
     )
-    rprint(f"CSV de salida: [bold]{output}[/bold] ({len(filtered)} filas)")
+    rprint(f"CSV de salida: [bold]{output}[/bold] ({summary.written} filas)")
     if enriched:
-        rprint(f"CSV enriquecido: [bold]{enriched}[/bold] ({total} filas)")
+        rprint(f"CSV enriquecido: [bold]{enriched}[/bold] ({summary.analyzed} filas)")
 
 
 def entrypoint() -> None:

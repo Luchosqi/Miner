@@ -1,73 +1,99 @@
-"""Lectura y escritura de archivos CSV con pandas."""
+"""Lectura y escritura de archivos CSV con pandas.
+
+El CSV de entrada puede pesar cientos de MB (una fila por repositorio, con
+columnas que guardan JSON extenso). Para no agotar la memoria, se lee siempre
+**por trozos** (``chunksize``): nunca hay un DataFrame con el archivo completo.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pandas as pd
 
-from miner.models import CandidateRepo, RepoResult
+from miner.models import CandidateRepo
 
 # Nombres habituales de la columna que contiene "owner/repo"
 _NAME_COLUMNS = ("name", "full_name", "fullName", "nameWithOwner", "repository", "repo")
 # ... o una URL desde la que se puede derivar
 _URL_COLUMNS = ("url", "html_url", "htmlUrl", "link", "repoUrl")
 
-# Columna auxiliar que Miner agrega internamente
-FULL_NAME_COL = "_full_name"
 RESULT_COL = "uses_ghaw"
+_CHUNK_ROWS = 20_000
 
 
-def read_candidates(path: str | Path) -> pd.DataFrame:
-    """Lee el CSV de entrada y agrega la columna auxiliar ``_full_name``.
-
-    Conserva todas las columnas originales intactas.
-    """
-    df = pd.read_csv(path)
-    if df.empty:
-        raise ValueError(f"El CSV {path!r} no contiene filas.")
-    df[FULL_NAME_COL] = _derive_full_names(df)
-    return df
-
-
-def _derive_full_names(df: pd.DataFrame) -> pd.Series:
-    source = _pick_column(df)
-    return df[source].map(lambda x: CandidateRepo(full_name=str(x)).full_name)
-
-
-def _pick_column(df: pd.DataFrame) -> str:
+def detect_name_column(path: str | Path) -> str:
+    """Devuelve el nombre de la columna que identifica al repositorio."""
+    header = pd.read_csv(path, nrows=0)
     for col in (*_NAME_COLUMNS, *_URL_COLUMNS):
-        if col in df.columns:
+        if col in header.columns:
             return col
     raise ValueError(
         "No se encontró una columna con el identificador del repositorio "
-        f"(owner/repo o URL). Columnas disponibles: {list(df.columns)}"
+        f"(owner/repo o URL). Columnas disponibles: {list(header.columns)}"
     )
 
 
-def write_results(
-    df: pd.DataFrame,
-    results: dict[str, RepoResult],
+def iter_candidate_names(
+    path: str | Path, *, chunksize: int = _CHUNK_ROWS
+) -> Iterator[str]:
+    """Itera los ``owner/repo`` del CSV, normalizados, leyendo por trozos."""
+    column = detect_name_column(path)
+    seen_any = False
+    for chunk in pd.read_csv(path, usecols=[column], chunksize=chunksize):
+        for raw in chunk[column]:
+            seen_any = True
+            yield CandidateRepo(full_name=str(raw)).full_name
+    if not seen_any:
+        raise ValueError(f"El CSV {str(path)!r} no contiene filas.")
+
+
+def write_filtered(
+    input_path: str | Path,
+    hits: set[str],
     output_path: str | Path,
     *,
     enriched_path: str | Path | None = None,
-) -> pd.DataFrame:
-    """Agrega la columna binaria ``uses_ghaw`` y escribe el/los CSV de salida.
+    chunksize: int = _CHUNK_ROWS,
+) -> int:
+    """Reescribe el CSV agregando la columna binaria ``uses_ghaw``.
 
-    * ``output_path``: solo las filas con ``uses_ghaw == 1`` (entrega final).
+    * ``output_path``: solo las filas cuyo repo está en ``hits`` (entrega final).
     * ``enriched_path`` (opcional): todas las filas, con la columna agregada.
 
-    Devuelve el DataFrame filtrado que se escribió en ``output_path``.
+    Lee y escribe por trozos. Devuelve el número de filas escritas en
+    ``output_path``.
     """
-    enriched = df.copy()
-    enriched[RESULT_COL] = (
-        enriched[FULL_NAME_COL].map(lambda fn: int(results[fn].uses_ghaw)).astype(int)
-    )
-    enriched = enriched.drop(columns=[FULL_NAME_COL])
+    column = detect_name_column(input_path)
+    written = 0
+    out_header_done = False
+    enr_header_done = False
 
-    if enriched_path is not None:
-        enriched.to_csv(enriched_path, index=False)
+    for chunk in pd.read_csv(input_path, chunksize=chunksize):
+        full_names = chunk[column].map(lambda x: CandidateRepo(full_name=str(x)).full_name)
+        chunk = chunk.copy()
+        chunk[RESULT_COL] = full_names.isin(hits).astype(int)
 
-    filtered = enriched[enriched[RESULT_COL] == 1].reset_index(drop=True)
-    filtered.to_csv(output_path, index=False)
-    return filtered
+        if enriched_path is not None:
+            chunk.to_csv(
+                enriched_path, index=False, mode="w" if not enr_header_done else "a",
+                header=not enr_header_done,
+            )
+            enr_header_done = True
+
+        keep = chunk[chunk[RESULT_COL] == 1]
+        if not keep.empty:
+            keep.to_csv(
+                output_path, index=False, mode="w" if not out_header_done else "a",
+                header=not out_header_done,
+            )
+            out_header_done = True
+            written += len(keep)
+
+    if not out_header_done:  # ningún repo cumplió: dejar el CSV solo con encabezados
+        header = pd.read_csv(input_path, nrows=0)
+        header[RESULT_COL] = pd.Series(dtype=int)
+        header.to_csv(output_path, index=False)
+
+    return written

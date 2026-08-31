@@ -22,3 +22,4 @@ dist/
 .vscode/
 .idea/
 .DS_Store
+miner_run.log*

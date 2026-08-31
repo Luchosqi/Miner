@@ -14,10 +14,15 @@ Este módulo separa dos responsabilidades:
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Sequence
 
 import httpx
+
+
+def _log(message: str) -> None:
+    print(f"[miner] {message}", file=sys.stderr, flush=True)
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 WORKFLOWS_EXPRESSION = "HEAD:.github/workflows"
@@ -83,8 +88,10 @@ class GitHubGraphQLClient:
         token: str,
         *,
         timeout: float = 60.0,
-        max_retries: int = 6,
+        max_retries: int = 8,
         min_remaining: int = 50,
+        request_delay: float = 0.0,
+        max_backoff: float = 300.0,
     ) -> None:
         if not token:
             raise ValueError("GITHUB_TOKEN vacío. Configúralo en el archivo .env")
@@ -97,6 +104,8 @@ class GitHubGraphQLClient:
         )
         self._max_retries = max_retries
         self._min_remaining = min_remaining
+        self._request_delay = request_delay
+        self._max_backoff = max_backoff
 
     # -- API pública -----------------------------------------------------------
 
@@ -105,6 +114,8 @@ class GitHubGraphQLClient:
         body = self._post_with_retry({"query": build_query(full_names)})
         data = body.get("data")
         self._respect_rate_limit(data)
+        if self._request_delay:
+            time.sleep(self._request_delay)
         return parse_batch_response(full_names, data)
 
     def close(self) -> None:
@@ -131,9 +142,18 @@ class GitHubGraphQLClient:
             if resp.status_code in self._RETRY_STATUS:
                 time.sleep(min(2**attempt, 30))
                 continue
-            if resp.status_code in (403, 429):  # rate limit secundario
-                wait = int(resp.headers.get("Retry-After", "60"))
-                time.sleep(max(wait, 30))
+            if resp.status_code in (403, 429):  # rate limit secundario / abuso
+                retry_after = resp.headers.get("Retry-After")
+                reset = resp.headers.get("x-ratelimit-reset")
+                if retry_after is not None:
+                    wait = float(retry_after)
+                elif reset is not None:
+                    wait = max(float(reset) - time.time(), 30.0)
+                else:
+                    wait = min(60.0 * (attempt + 1), self._max_backoff)
+                wait = min(max(wait, 30.0), self._max_backoff)
+                _log(f"HTTP {resp.status_code} (rate limit); esperando {wait:.0f}s")
+                time.sleep(wait)
                 continue
 
             resp.raise_for_status()
@@ -142,6 +162,7 @@ class GitHubGraphQLClient:
             if body.get("data") is None and body.get("errors"):
                 message = str(body["errors"][0].get("message", "")).lower()
                 if "rate limit" in message or "timeout" in message:
+                    _log(f"GraphQL: {message[:80]}; esperando 60s")
                     time.sleep(60)
                     continue
                 raise RuntimeError(f"GraphQL error: {body['errors'][:2]}")
@@ -163,4 +184,5 @@ class GitHubGraphQLClient:
         except Exception:  # noqa: BLE001
             wait = 60.0
         if wait > 0:
+            _log(f"presupuesto GraphQL casi agotado (remaining={remaining}); esperando {wait:.0f}s al reset")
             time.sleep(wait + 1)

@@ -20,7 +20,7 @@ from rich.progress import (
 
 from miner.csv_io import FULL_NAME_COL, read_candidates, write_results
 from miner.detector import find_ghaw_pairs
-from miner.github_client import GitHubGraphQLClient
+from miner.github_client import GitHubGraphQLClient, _log
 from miner.models import RepoResult
 
 
@@ -64,7 +64,8 @@ def run(
     token: str,
     *,
     batch_size: int = 50,
-    workers: int = 4,
+    workers: int = 2,
+    request_delay: float = 0.3,
     enriched_csv: str | Path | None = None,
     checkpoint_path: str | Path | None = ".miner_checkpoint.jsonl",
 ) -> tuple[dict[str, RepoResult], pd.DataFrame]:
@@ -93,7 +94,10 @@ def run(
     )
 
     try:
-        with GitHubGraphQLClient(token) as client, Progress(*columns) as progress:
+        with (
+            GitHubGraphQLClient(token, request_delay=request_delay) as client,
+            Progress(*columns) as progress,
+        ):
             task = progress.add_task(
                 "Analizando repositorios", total=len(all_names), completed=len(results)
             )
@@ -102,6 +106,7 @@ def run(
                 mapping = client.fetch_workflow_files(batch)
                 return [result_from_files(name, files) for name, files in mapping.items()]
 
+            done_since_log = 0
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
                     pool.submit(handle_batch, batch): batch
@@ -117,6 +122,13 @@ def run(
                                 ck_file.write(res.model_dump_json() + "\n")
                             ck_file.flush()
                     progress.advance(task, len(batch_results))
+                    done_since_log += len(batch_results)
+                    if done_since_log >= 5000:
+                        done_since_log = 0
+                        hits = sum(1 for r in results.values() if r.uses_ghaw)
+                        _log(
+                            f"{len(results)}/{len(all_names)} repos · {hits} usan GH-AW"
+                        )
     finally:
         if ck_file is not None:
             ck_file.close()

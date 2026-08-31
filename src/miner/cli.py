@@ -41,7 +41,13 @@ def main(
         50, "--batch-size", "-b", min=1, max=100, help="Repositorios por consulta GraphQL."
     ),
     workers: int = typer.Option(
-        4, "--workers", "-w", min=1, max=16, help="Consultas GraphQL concurrentes."
+        2, "--workers", "-w", min=1, max=16, help="Consultas GraphQL concurrentes."
+    ),
+    request_delay: float = typer.Option(
+        0.3,
+        "--request-delay",
+        min=0.0,
+        help="Pausa (s) tras cada consulta, para no gatillar el rate limit secundario.",
     ),
     checkpoint: Path = typer.Option(
         ".miner_checkpoint.jsonl",
@@ -68,6 +74,7 @@ def main(
         token,
         batch_size=batch_size,
         workers=workers,
+        request_delay=request_delay,
         enriched_csv=enriched,
         checkpoint_path=None if no_checkpoint else checkpoint,
     )

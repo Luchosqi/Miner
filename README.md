@@ -23,6 +23,15 @@ un **par de archivos con el mismo nombre base**:
 
 Ejemplo: `daily-report.md` + `daily-report.lock.yml`.
 
+### ¿Por qué GraphQL y no la API REST?
+
+El listado de candidatos puede tener cientos de miles de repositorios.
+Consultarlos uno por uno con la API REST (una petición por repo) choca con el
+límite de 5.000 peticiones/hora. Miner usa la **API GraphQL de GitHub** a través
+de **HTTPX**: una sola consulta pide el contenido de `.github/workflows/` de
+hasta 100 repositorios (mediante *alias*) y ese lote completo cuesta **1 punto**
+del presupuesto horario. Así el dataset completo se procesa en un par de horas.
+
 ## Requisitos
 
 - Python 3.10 o superior
@@ -45,7 +54,7 @@ source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
-Esto instala Miner y sus dependencias: Typer, Pydantic, pandas, PyGithub,
+Esto instala Miner y sus dependencias: Typer, Pydantic, pandas, HTTPX,
 python-dotenv, Rich y pytest.
 
 ## Configurar el token de GitHub
@@ -78,7 +87,14 @@ Opciones:
 |---|---|---|
 | `--output`, `-o` | CSV de salida (solo repos que usan GH-AW) | `repositorios_ghaw.csv` |
 | `--enriched` | CSV adicional con **todas** las filas y la columna binaria `uses_ghaw` | — |
-| `--workers`, `-w` | Consultas concurrentes a la API de GitHub | `8` |
+| `--batch-size`, `-b` | Repositorios por consulta GraphQL (1-100) | `50` |
+| `--workers`, `-w` | Consultas GraphQL concurrentes | `4` |
+| `--checkpoint` | Archivo de avance; volver a ejecutar retoma donde quedó | `.miner_checkpoint.jsonl` |
+| `--no-checkpoint` | Ignora el checkpoint y empieza de cero | — |
+
+El proceso guarda cada resultado en el archivo de checkpoint. Si se interrumpe
+(corte de red, Ctrl-C), basta con volver a ejecutar el mismo comando: retoma
+donde quedó.
 
 Ejemplo con CSV enriquecido:
 
@@ -121,10 +137,11 @@ src/miner/
   detector.py       # lógica pura: detección de pares .md / .lock.yml
   models.py         # modelos Pydantic (validación de datos)
   csv_io.py         # lectura/escritura de CSV con pandas
-  github_client.py  # acceso a la API de GitHub (PyGithub)
-  pipeline.py       # orquestación del proceso completo
+  github_client.py  # acceso a la API de GitHub vía HTTPX + GraphQL (batching)
+  pipeline.py       # orquestación concurrente + checkpoint
   cli.py            # interfaz de línea de comandos (Typer)
 tests/
   test_detector.py
   test_csv_io.py
+  test_github_client.py
 ```

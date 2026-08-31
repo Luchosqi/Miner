@@ -14,6 +14,8 @@ dist/
 # Datos (entradas/salidas locales, no se versionan)
 *.csv
 *.crdownload
+.miner_checkpoint.jsonl
+*.jsonl
 
 # Editores / SO
 .vscode/

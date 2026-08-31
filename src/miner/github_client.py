@@ -1,46 +1,166 @@
-"""Acceso a la API de GitHub mediante PyGithub."""
+"""Acceso a la API de GitHub mediante HTTPX y GraphQL.
+
+El dataset de candidatos tiene cientos de miles de repositorios. Consultarlos
+uno por uno con la API REST (una petición por repo) es inviable frente al límite
+de 5.000 peticiones/hora. GraphQL permite pedir el contenido de
+``.github/workflows/`` de **muchos repositorios en una sola petición** mediante
+alias, y ese lote completo cuesta 1 punto del presupuesto horario.
+
+Este módulo separa dos responsabilidades:
+
+* funciones puras (``build_query`` / ``parse_batch_response``) — cubiertas por tests;
+* la clase ``GitHubGraphQLClient`` — la parte que habla por red.
+"""
 
 from __future__ import annotations
 
-from github import Auth, Github
-from github.ContentFile import ContentFile
-from github.GithubException import GithubException, UnknownObjectException
+import time
+from collections.abc import Sequence
 
-WORKFLOWS_PATH = ".github/workflows"
+import httpx
+
+GRAPHQL_URL = "https://api.github.com/graphql"
+WORKFLOWS_EXPRESSION = "HEAD:.github/workflows"
+
+# Nombres de archivo dentro de .github/workflows/, o None si el repo no es
+# accesible (no existe, es privado, fue renombrado, etc.).
+WorkflowFiles = list[str] | None
 
 
-class GitHubClient:
-    """Envoltorio delgado sobre PyGithub para lo único que Miner necesita:
-    listar los archivos dentro de ``.github/workflows/`` de un repositorio.
+def _alias(index: int) -> str:
+    return f"r{index}"
+
+
+def _escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def build_query(full_names: Sequence[str]) -> str:
+    """Arma una consulta GraphQL que pide, por cada repo, los archivos que hay
+    dentro de ``.github/workflows/`` (en su rama por defecto)."""
+    parts = ["rateLimit { cost remaining resetAt }"]
+    for i, full_name in enumerate(full_names):
+        owner, _, name = full_name.partition("/")
+        parts.append(
+            f'{_alias(i)}: repository(owner: "{_escape(owner)}", name: "{_escape(name)}") {{ '
+            f'object(expression: "{WORKFLOWS_EXPRESSION}") {{ '
+            f"... on Tree {{ entries {{ name }} }} }} }}"
+        )
+    return "query {\n  " + "\n  ".join(parts) + "\n}"
+
+
+def parse_batch_response(
+    full_names: Sequence[str], data: dict | None
+) -> dict[str, WorkflowFiles]:
+    """Traduce el ``data`` de la respuesta GraphQL a ``{repo: [archivos] | None}``.
+
+    * ``None``  -> el repositorio no es accesible.
+    * ``[]``    -> el repositorio existe pero no tiene ``.github/workflows/``.
+    * ``[...]`` -> nombres de archivo dentro de ``.github/workflows/``.
     """
+    data = data or {}
+    result: dict[str, WorkflowFiles] = {}
+    for i, full_name in enumerate(full_names):
+        node = data.get(_alias(i))
+        if node is None:
+            result[full_name] = None
+            continue
+        tree = node.get("object")
+        if not tree:
+            result[full_name] = []
+            continue
+        result[full_name] = [entry["name"] for entry in tree.get("entries", [])]
+    return result
 
-    def __init__(self, token: str, *, per_page: int = 100) -> None:
+
+class GitHubGraphQLClient:
+    """Cliente GraphQL sobre HTTPX, con reintentos y respeto del rate limit."""
+
+    _RETRY_STATUS = {500, 502, 503, 504}
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        timeout: float = 60.0,
+        max_retries: int = 6,
+        min_remaining: int = 50,
+    ) -> None:
         if not token:
             raise ValueError("GITHUB_TOKEN vacío. Configúralo en el archivo .env")
-        self._gh = Github(auth=Auth.Token(token), per_page=per_page)
+        self._client = httpx.Client(
+            headers={
+                "Authorization": f"bearer {token}",
+                "User-Agent": "miner-ghaw",
+            },
+            timeout=timeout,
+        )
+        self._max_retries = max_retries
+        self._min_remaining = min_remaining
 
-    def list_workflow_files(self, full_name: str) -> list[str]:
-        """Nombres de archivo dentro de ``.github/workflows/`` del repo.
+    # -- API pública -----------------------------------------------------------
 
-        Devuelve una lista vacía si el repo no existe, es privado/inaccesible,
-        o no contiene ese directorio.
-        """
+    def fetch_workflow_files(self, full_names: Sequence[str]) -> dict[str, WorkflowFiles]:
+        """Consulta un lote de repos y devuelve ``{repo: [archivos] | None}``."""
+        body = self._post_with_retry({"query": build_query(full_names)})
+        data = body.get("data")
+        self._respect_rate_limit(data)
+        return parse_batch_response(full_names, data)
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "GitHubGraphQLClient":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # -- interno -------------------------------------------------------------
+
+    def _post_with_retry(self, payload: dict) -> dict:
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries):
+            try:
+                resp = self._client.post(GRAPHQL_URL, json=payload)
+            except httpx.TransportError as exc:  # red inestable
+                last_error = exc
+                time.sleep(min(2**attempt, 30))
+                continue
+
+            if resp.status_code in self._RETRY_STATUS:
+                time.sleep(min(2**attempt, 30))
+                continue
+            if resp.status_code in (403, 429):  # rate limit secundario
+                wait = int(resp.headers.get("Retry-After", "60"))
+                time.sleep(max(wait, 30))
+                continue
+
+            resp.raise_for_status()
+            body = resp.json()
+
+            if body.get("data") is None and body.get("errors"):
+                message = str(body["errors"][0].get("message", "")).lower()
+                if "rate limit" in message or "timeout" in message:
+                    time.sleep(60)
+                    continue
+                raise RuntimeError(f"GraphQL error: {body['errors'][:2]}")
+            return body
+
+        raise RuntimeError(f"GraphQL: reintentos agotados ({last_error})")
+
+    def _respect_rate_limit(self, data: dict | None) -> None:
+        info = (data or {}).get("rateLimit") or {}
+        remaining = info.get("remaining")
+        reset_at = info.get("resetAt")
+        if remaining is None or remaining > self._min_remaining:
+            return
         try:
-            repo = self._gh.get_repo(full_name)
-            contents = repo.get_contents(WORKFLOWS_PATH)
-        except UnknownObjectException:
-            return []
-        except GithubException as exc:
-            if exc.status in (403, 404, 451):
-                return []
-            raise
+            from datetime import datetime, timezone
 
-        if isinstance(contents, ContentFile):  # el path resultó ser un archivo
-            return [contents.name]
-        return [c.name for c in contents if c.type == "file"]
-
-    def rate_limit_remaining(self) -> int | None:
-        try:
-            return self._gh.get_rate_limit().core.remaining
-        except GithubException:
-            return None
+            reset = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+            wait = (reset - datetime.now(timezone.utc)).total_seconds()
+        except Exception:  # noqa: BLE001
+            wait = 60.0
+        if wait > 0:
+            time.sleep(wait + 1)

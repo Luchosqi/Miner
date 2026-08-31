@@ -37,11 +37,22 @@ def main(
         "--enriched",
         help="Opcional: CSV con TODAS las filas y la columna binaria 'uses_ghaw'.",
     ),
+    batch_size: int = typer.Option(
+        50, "--batch-size", "-b", min=1, max=100, help="Repositorios por consulta GraphQL."
+    ),
     workers: int = typer.Option(
-        8, "--workers", "-w", min=1, max=32, help="Consultas concurrentes a la API de GitHub."
+        4, "--workers", "-w", min=1, max=16, help="Consultas GraphQL concurrentes."
+    ),
+    checkpoint: Path = typer.Option(
+        ".miner_checkpoint.jsonl",
+        "--checkpoint",
+        help="Archivo de avance; volver a ejecutar retoma donde quedó.",
+    ),
+    no_checkpoint: bool = typer.Option(
+        False, "--no-checkpoint", help="Desactiva el checkpoint (empieza de cero)."
     ),
 ) -> None:
-    """Lee el CSV, consulta cada repo en GitHub, detecta GH-AW y escribe el CSV filtrado."""
+    """Lee el CSV, consulta cada repo en GitHub vía GraphQL, detecta GH-AW y escribe el CSV filtrado."""
     load_dotenv()
     token = os.getenv("GITHUB_TOKEN", "").strip()
     if not token:
@@ -52,7 +63,13 @@ def main(
         raise typer.Exit(code=1)
 
     results, filtered = run(
-        input_csv, output, token, workers=workers, enriched_csv=enriched
+        input_csv,
+        output,
+        token,
+        batch_size=batch_size,
+        workers=workers,
+        enriched_csv=enriched,
+        checkpoint_path=None if no_checkpoint else checkpoint,
     )
 
     total = len(results)
@@ -61,7 +78,7 @@ def main(
 
     rprint(
         f"\n[green]Proceso terminado.[/green] "
-        f"{total} repos analizados · [bold]{hits}[/bold] usan GH-AW · {errors} con error."
+        f"{total} repos analizados · [bold]{hits}[/bold] usan GH-AW · {errors} no accesibles."
     )
     rprint(f"CSV de salida: [bold]{output}[/bold] ({len(filtered)} filas)")
     if enriched:

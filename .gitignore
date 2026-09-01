@@ -13,6 +13,8 @@ dist/
 
 # Datos (entradas/salidas locales, no se versionan)
 *.csv
+# Excepción: el resultado de la tarea sí se versiona
+!repositorios_ghaw.csv
 *.crdownload
 .miner_checkpoint.jsonl
 *.jsonl

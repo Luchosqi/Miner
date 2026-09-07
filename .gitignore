@@ -19,6 +19,8 @@ dist/
 .miner_checkpoint.jsonl
 *.jsonl
 *.log
+*.parquet
+/dataset/
 
 # Editores / SO
 .vscode/

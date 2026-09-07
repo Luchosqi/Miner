@@ -2,7 +2,14 @@
 
 Miner identifica, a partir de un archivo CSV de repositorios de GitHub, cuáles
 utilizan **GitHub Agentic Workflows (GH-AW)** y genera un nuevo CSV que contiene
-únicamente esos repositorios.
+únicamente esos repositorios. Además, extrae el contenido de sus archivos
+`.md` de GH-AW (frontmatter YAML + body Markdown) y lo transforma en un
+dataset relacional en formato **Apache Parquet**.
+
+Documentación de la Tarea 3 (dataset relacional): [docs/](docs/)
+- [Diagrama entidad-relación](docs/er-diagram.md)
+- [Diccionario de datos](docs/data-dictionary.md)
+- [Uso de la CLI](docs/cli-usage.md)
 
 ## ¿Qué problema resuelve?
 
@@ -77,8 +84,10 @@ El archivo `.env` está en `.gitignore`: **nunca se sube al repositorio**.
 
 ## Ejecutar Miner
 
+### 1. Detectar repositorios que usan GH-AW
+
 ```bash
-miner repositorios.csv --output repositorios_ghaw.csv
+miner mine repositorios.csv --output repositorios_ghaw.csv
 ```
 
 Opciones:
@@ -99,8 +108,24 @@ donde quedó.
 Ejemplo con CSV enriquecido:
 
 ```bash
-miner repositorios.csv -o repositorios_ghaw.csv --enriched repositorios_enriquecido.csv
+miner mine repositorios.csv -o repositorios_ghaw.csv --enriched repositorios_enriquecido.csv
 ```
+
+### 2. Construir el dataset relacional (Parquet)
+
+A partir del CSV de repositorios que usan GH-AW, `miner dataset` descarga cada
+archivo `.md` de `.github/workflows/`, separa su frontmatter YAML del body
+Markdown y genera tres tablas `.parquet` (`repositories`, `workflow_files`,
+`frontmatter_entries`):
+
+```bash
+miner dataset repositorios_ghaw.csv --output-dir dataset
+```
+
+Ver [docs/cli-usage.md](docs/cli-usage.md) para todas las opciones y un
+ejemplo completo, y [docs/er-diagram.md](docs/er-diagram.md) /
+[docs/data-dictionary.md](docs/data-dictionary.md) para el esquema del
+dataset.
 
 ### Entrada
 
@@ -134,14 +159,23 @@ corresponde a un GitHub Agentic Workflow:
 
 ```
 src/miner/
-  detector.py       # lógica pura: detección de pares .md / .lock.yml
-  models.py         # modelos Pydantic (validación de datos)
-  csv_io.py         # lectura/escritura de CSV con pandas
-  github_client.py  # acceso a la API de GitHub vía HTTPX + GraphQL (batching)
-  pipeline.py       # orquestación concurrente + checkpoint
-  cli.py            # interfaz de línea de comandos (Typer)
+  detector.py           # lógica pura: detección de pares .md / .lock.yml
+  models.py             # modelos Pydantic (validación de datos)
+  csv_io.py             # lectura/escritura de CSV con pandas
+  github_client.py      # acceso a la API de GitHub vía HTTPX + GraphQL (batching)
+  pipeline.py           # orquestación de 'miner mine' (concurrente + checkpoint)
+  frontmatter_parser.py # separa y aplana el frontmatter YAML de los .md de GH-AW
+  workflows_dataset.py  # construye las tablas del esquema entidad-relación (pandas)
+  dataset_pipeline.py   # orquestación de 'miner dataset' (descarga + tablas + Parquet)
+  cli.py                # interfaz de línea de comandos (Typer): 'mine' y 'dataset'
 tests/
   test_detector.py
   test_csv_io.py
   test_github_client.py
+  test_frontmatter_parser.py
+  test_workflows_dataset.py
+docs/
+  er-diagram.md       # diagrama entidad-relación del dataset
+  data-dictionary.md  # diccionario de datos (tablas, columnas, PK/FK)
+  cli-usage.md        # instrucciones de uso de 'miner dataset'
 ```

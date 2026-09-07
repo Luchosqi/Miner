@@ -1,6 +1,11 @@
 """Pruebas de las funciones puras del cliente GraphQL."""
 
-from miner.github_client import build_query, parse_batch_response
+from miner.github_client import (
+    build_content_query,
+    build_query,
+    parse_batch_response,
+    parse_content_response,
+)
 from miner.pipeline import result_from_files
 
 
@@ -40,6 +45,29 @@ class TestParseBatchResponse:
         }
         out = parse_batch_response(["x/0", "x/1", "x/2"], data)
         assert out == {"x/0": ["r.md", "r.lock.yml"], "x/1": [], "x/2": None}
+
+
+class TestBuildContentQuery:
+    def test_incluye_expresion_del_blob(self):
+        q = build_content_query([("octocat/Hello-World", ".github/workflows/report.md")])
+        assert 'r0: repository(owner: "octocat", name: "Hello-World")' in q
+        assert 'expression: "HEAD:.github/workflows/report.md"' in q
+        assert "... on Blob { text }" in q
+
+
+class TestParseContentResponse:
+    def test_archivo_con_texto(self):
+        data = {"r0": {"object": {"text": "---\non: push\n---\nhola"}}}
+        refs = [("a/b", ".github/workflows/x.md")]
+        assert parse_content_response(refs, data) == {refs[0]: "---\non: push\n---\nhola"}
+
+    def test_repo_inaccesible_es_none(self):
+        refs = [("a/b", ".github/workflows/x.md")]
+        assert parse_content_response(refs, {"r0": None}) == {refs[0]: None}
+
+    def test_archivo_no_encontrado_es_none(self):
+        refs = [("a/b", ".github/workflows/x.md")]
+        assert parse_content_response(refs, {"r0": {"object": None}}) == {refs[0]: None}
 
 
 class TestResultFromFiles:

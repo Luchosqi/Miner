@@ -54,6 +54,44 @@ def build_query(full_names: Sequence[str]) -> str:
     return "query {\n  " + "\n  ".join(parts) + "\n}"
 
 
+FileRef = tuple[str, str]  # (full_name, path)
+
+
+def build_content_query(refs: Sequence[FileRef]) -> str:
+    """Arma una consulta GraphQL que pide el contenido (texto) de archivos puntuales.
+
+    A diferencia de ``build_query`` (que lista un directorio), esta pide el
+    ``text`` de blobs específicos -- por ejemplo, cada archivo ``.md`` de GH-AW
+    ya identificado como par válido.
+    """
+    parts = ["rateLimit { cost remaining resetAt }"]
+    for i, (full_name, path) in enumerate(refs):
+        owner, _, name = full_name.partition("/")
+        expression = f"HEAD:{path}"
+        parts.append(
+            f'{_alias(i)}: repository(owner: "{_escape(owner)}", name: "{_escape(name)}") {{ '
+            f'object(expression: "{_escape(expression)}") {{ '
+            f"... on Blob {{ text }} }} }}"
+        )
+    return "query {\n  " + "\n  ".join(parts) + "\n}"
+
+
+def parse_content_response(
+    refs: Sequence[FileRef], data: dict | None
+) -> dict[FileRef, str | None]:
+    """Traduce la respuesta de ``build_content_query`` a ``{(repo, path): texto | None}``.
+
+    ``None`` si el repo/archivo no es accesible o no es un blob de texto.
+    """
+    data = data or {}
+    result: dict[FileRef, str | None] = {}
+    for i, ref in enumerate(refs):
+        node = data.get(_alias(i))
+        blob = (node or {}).get("object") if node else None
+        result[ref] = blob.get("text") if blob else None
+    return result
+
+
 def parse_batch_response(
     full_names: Sequence[str], data: dict | None
 ) -> dict[str, WorkflowFiles]:
@@ -117,6 +155,15 @@ class GitHubGraphQLClient:
         if self._request_delay:
             time.sleep(self._request_delay)
         return parse_batch_response(full_names, data)
+
+    def fetch_file_contents(self, refs: Sequence[FileRef]) -> dict[FileRef, str | None]:
+        """Consulta un lote de archivos puntuales y devuelve ``{(repo, path): texto | None}``."""
+        body = self._post_with_retry({"query": build_content_query(refs)})
+        data = body.get("data")
+        self._respect_rate_limit(data)
+        if self._request_delay:
+            time.sleep(self._request_delay)
+        return parse_content_response(refs, data)
 
     def close(self) -> None:
         self._client.close()
